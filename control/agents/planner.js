@@ -29,7 +29,6 @@ function createPlanner(opts = {}) {
   const marginThreshold = opts.probeMarginThreshold ?? control.probeMarginThreshold;
   const config = opts.tuning ?? tuning;
   let plan = null;
-  let seq = 0;
 
   // -------------------------------------------------------------------------
   // Which hypothesis does the evidence actually support?
@@ -208,15 +207,18 @@ function createPlanner(opts = {}) {
     const graph = graphOf(incident.edges);
     const degraded = Array.isArray(incident.services) ? incident.services : [];
 
-    seq += 1;
     const generated = optionsFor(service, graph, degraded)
       .sort((a, b) => DIRECTNESS[a.actionType] - DIRECTNESS[b.actionType] || a.target.localeCompare(b.target));
 
-    const options = generated.map((o, i) => {
+    const options = generated.map((o) => {
       const reversible = REVERSIBLE[o.actionType];
       const { autonomy, gateReason } = gate(o.actionType, reversible, effectiveConfidence);
       return {
-        id: `OPT-${seq}-${i + 1}`,
+        // Stable across re-plans. The plan is rebuilt every window, so an id derived from a
+        // rebuild counter changes underneath an operator who is reading the console — they
+        // click approve and the id they saw no longer exists. (actionType, target) is unique
+        // within a plan and does not move.
+        id: `OPT-${o.actionType}-${o.target}`,
         actionType: o.actionType,
         target: o.target,
         params: o.params,
@@ -239,7 +241,7 @@ function createPlanner(opts = {}) {
         }
         return !useless;
       })
-      .map((o, i) => ({ ...o, id: `OPT-${seq}-${i + 1}` }));
+
 
     // Recommend the most direct option that is not blocked. A blocked plan recommends
     // nothing rather than quietly suggesting the least-bad forbidden action.
@@ -273,7 +275,7 @@ function createPlanner(opts = {}) {
 
   return {
     build,
-    reset: () => { plan = null; seq = 0; },
+    reset: () => { plan = null; },
     current: () => plan,
     lastReason: () => null,
   };

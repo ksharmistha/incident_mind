@@ -8,8 +8,8 @@
 //   POST /approve  -> the console's approval gate for irreversible actions
 //   WS   /stream   -> ControlState on every change, full snapshot on connect
 //
-// Outbound, the control plane touches the data plane only through POST /admin/* and never
-// through /chaos/*. Chaos endpoints are operator-only.
+// Outbound, the control plane touches the data plane only through POST /admin/*. The
+// fault-injection routes are operator-only and unreachable from here by construction.
 
 const http = require('http');
 const express = require('express');
@@ -22,6 +22,7 @@ const { createDetector } = require('./agents/detector');
 const { createScorer } = require('./agents/scorer');
 const { createExperimenter } = require('./agents/experimenter');
 const { createPlanner } = require('./agents/planner');
+const { createExecutor } = require('./agents/executor');
 const admin = require('./adapters/admin');
 const { PORTS, validationEnabled } = require('./adapters/contracts');
 const { tuning, control, derived } = require('./adapters/tuning');
@@ -43,25 +44,37 @@ app.post('/reset', (req, res) => {
   scorer.reset();
   experimenter.reset();
   planner.reset();
+  executor.reset();
   admin.reset();
   supervisor.resetStats();
   res.json({ ok: true, cleared });
 });
 
-app.post('/approve', (req, res) => {
+// The console's approval gate. Approving records consent for one option on one incident,
+// then hands it to the Executor — the only component that can act.
+app.post('/approve', async (req, res) => {
   const { optionId } = req.body || {};
   if (!optionId) return res.status(400).json({ error: 'optionId required' });
 
-  const plan = state.get().plan;
+  const { incident, plan } = state.get();
+  if (!incident) return res.status(409).json({ error: 'no active incident' });
   if (!plan) return res.status(409).json({ error: 'no plan awaiting approval' });
 
-  const option = plan.options.find((o) => o.id === optionId);
-  if (!option) return res.status(404).json({ error: `unknown optionId "${optionId}"` });
+  const approval = executor.approve(incident, plan, optionId);
+  if (!approval.ok) {
+    const status = approval.code === 'UNKNOWN_OPTION' ? 404 : 409;
+    return res.status(status).json({ error: approval.reason, code: approval.code });
+  }
 
-  // Wired to the Executor in M10. Approving is recorded now so the seam exists and the
-  // console can be built against it.
-  console.log(`[control] approved ${optionId} (${option.actionType} on ${option.target})`);
-  res.json({ ok: true, optionId });
+  const outcome = await runAction(optionId, 'approved by operator');
+  if (outcome.record) {
+    // A retried approval returns the record of what already happened rather than doing it
+    // again — idempotent from the console's point of view, and explicit about which it was.
+    const duplicate = outcome.refusal?.code === 'ALREADY_EXECUTED';
+    return res.status(outcome.record.outcome === 'APPLIED' ? 200 : 502)
+      .json({ ok: outcome.record.outcome === 'APPLIED', optionId, duplicate, actionRecord: outcome.record });
+  }
+  return res.status(409).json({ error: outcome.refusal.reason, code: outcome.refusal.code });
 });
 
 // Operational visibility for the build. Not part of any contract and not on the demo path.
@@ -76,6 +89,7 @@ app.get('/debug/status', (req, res) => {
     scorer: scorer.last(),
     experimenter: { inFlight: experimenter.isInFlight(), probe: experimenter.current()?.id ?? null },
     openBreakers: admin.openBreakers(),
+    executor: executor.stats(),
     planner: state.get().plan ? { options: state.get().plan.options.length, effectiveConfidence: state.get().plan.effectiveConfidence, recommended: state.get().plan.recommendedOptionId } : null,
     state: state.get(),
   });
@@ -108,12 +122,63 @@ const detector = createDetector();
 const scorer = createScorer();
 const experimenter = createExperimenter({ windowMs: tuning.collector.windowMs });
 const planner = createPlanner();
+const executor = createExecutor();
 
 // POST /reset must be able to stop an experiment from any state.
 state.onProbeAbort(() => experimenter.abort());
 
 // Kicked off from the detector tick but deliberately NOT awaited: a probe takes seconds,
 // and detection must keep running throughout. Telemetry never stalls behind an experiment.
+// One execution path, whether the trigger was a human approval or the autonomy gate.
+// Runs under the supervisor's executor budget: a hang becomes EXECUTION_FAILED rather
+// than a stalled control plane.
+async function runAction(optionId, why) {
+  const { incident, plan } = state.get();
+  const run = await supervisor.run('executor', () => executor.execute({
+    incident, plan, optionId,
+    publish: async (pending) => {
+      state.update({ plan: { ...state.get().plan, executing: pending } },
+        `executing ${pending.actionType} on ${pending.target} (${why})`);
+    },
+  }));
+
+  // The supervisor exhausted its budget. The Executor never claims success, and neither
+  // does the record we write on its behalf.
+  if (!run.ok) {
+    const record = {
+      actionId: `ACT-${incident?.id ?? 'UNKNOWN'}-${optionId}`,
+      optionId, issuedAt: Date.now(), target: plan?.options.find((o) => o.id === optionId)?.target ?? 'unknown',
+      httpStatus: null, outcome: 'EXECUTION_FAILED',
+      error: `executor exceeded its ${supervisor.AGENTS.executor.timeoutMs}ms budget`,
+    };
+    state.update({ plan: { ...state.get().plan, executing: null, action: record } }, `executor budget exceeded for ${optionId}`);
+    return { record, refusal: null };
+  }
+
+  const { record, refusal } = run.value;
+  if (record && refusal) return { record, refusal };   // already executed: nothing to re-broadcast
+  if (record) {
+    state.update({ plan: { ...state.get().plan, executing: null, action: record } },
+      `action ${record.actionId} ${record.outcome}`);
+  } else {
+    state.update({ plan: { ...state.get().plan, executing: null } }, `execution refused: ${refusal.reason}`);
+  }
+  return { record, refusal };
+}
+
+// An AUTONOMOUS action may run without a human, but only the one the Planner actually
+// recommends. Acting on a non-recommended option — mitigating while a human is still
+// considering the fix — is not something the specification authorises.
+async function maybeAutonomous() {
+  const { incident, plan } = state.get();
+  if (!incident || !plan || !plan.recommendedOptionId) return;
+  const option = plan.options.find((o) => o.id === plan.recommendedOptionId);
+  if (!option || option.autonomy !== 'AUTONOMOUS') return;
+  if (!executor.eligible(incident, plan, option.id).ok) return;
+  console.log(`[control] autonomous execution of ${option.id} (${option.gateReason})`);
+  await runAction(option.id, 'autonomy gate');
+}
+
 // The Planner describes; it never acts. Execution is the Executor's, behind the approval
 // gate the plan itself declares.
 async function replan(probeResult) {
@@ -130,6 +195,7 @@ async function replan(probeResult) {
   state.update({ plan: run.value }, run.value
     ? `planner: ${run.value.options.length} options, effConf ${run.value.effectiveConfidence}, recommending ${run.value.recommendedOptionId || 'nothing'}`
     : 'planner: no supported action');
+  await maybeAutonomous();
 }
 
 function maybeExperiment(incident, ranked, window) {

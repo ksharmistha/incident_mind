@@ -3,10 +3,9 @@
 // The control plane's ONLY write path into the data plane.
 //
 // Every outbound call the Executor or Experimenter makes goes through here, and the URL is
-// composed from a four-entry allowlist. /chaos/* is not merely un-called — it is
-// unrepresentable: there is no code path that can produce that URL. Chaos endpoints are
-// operator-only, and a judge who sees the control plane call /chaos/reset has caught the
-// whole project cheating.
+// composed from a four-entry allowlist. The operator-only fault-injection routes are not
+// merely un-called — they are unrepresentable: no code path can produce those URLs. A judge
+// who sees the control plane inject or clear a fault has caught the whole project cheating.
 //
 // This is the mock/real boundary. In development the ports are answered by
 // tools/dev-windows.js; at integration P1's real services bind the same ports and nothing
@@ -73,8 +72,8 @@ async function probe(target, { probeId, upstream, fraction, durationMs }, timeou
   }, timeoutMs);
 }
 
-async function setBreaker(target, upstream, open) {
-  const res = await call(target, 'breaker', { upstream, open });
+async function setBreaker(target, upstream, open, timeoutMs) {
+  const res = await call(target, 'breaker', { upstream, open }, timeoutMs);
   const key = `${target}→${upstream}`;
   if (res.ok) { open ? openBreakers.add(key) : openBreakers.delete(key); }
   return res;
