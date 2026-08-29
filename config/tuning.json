@@ -7,13 +7,13 @@
     "timeoutMs": { "auth": 300, "checkout": 800 },
     "retries": 2,
     "backoffBaseMs": 50,
-    "bulkhead": { "auth": 64 }
+    "bulkhead": { "auth": 140 }
   },
   "auth": {
     "workUnits": { "2.4.0": 1, "2.4.1": 18 }
   },
   "datastore": {
-    "poolSize": 12,
+    "poolSize": 64,
     "queueMax": 500,
     "serviceTimeMs": 20,
     "compactionServiceTimeMs": 45
