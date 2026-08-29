@@ -241,6 +241,12 @@ async function maybeAutonomous() {
 async function replan(probeResult) {
   const current = state.get();
   if (!current.incident) return;
+
+  // Once an action has been issued for this incident, the plan is committed. Re-planning
+  // would overwrite the action and verification state hanging off it — the console would
+  // show "awaiting approval" while an action is mid-verification — and §10.5 is explicit
+  // that the system escalates rather than silently trying the next option.
+  if (current.plan && (current.plan.action || current.plan.executing || current.plan.verification)) return;
   const [newest] = telemetry.recent(1);
   const run = await supervisor.run('planner', () => planner.build({
     incident: current.incident,
