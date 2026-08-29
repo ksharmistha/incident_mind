@@ -21,6 +21,7 @@ const telemetry = require('./adapters/telemetry');
 const { createDetector } = require('./agents/detector');
 const { createScorer } = require('./agents/scorer');
 const { createExperimenter } = require('./agents/experimenter');
+const { createPlanner } = require('./agents/planner');
 const admin = require('./adapters/admin');
 const { PORTS, validationEnabled } = require('./adapters/contracts');
 const { tuning, control, derived } = require('./adapters/tuning');
@@ -41,6 +42,7 @@ app.post('/reset', (req, res) => {
   detector.reset();
   scorer.reset();
   experimenter.reset();
+  planner.reset();
   admin.reset();
   supervisor.resetStats();
   res.json({ ok: true, cleared });
@@ -74,6 +76,7 @@ app.get('/debug/status', (req, res) => {
     scorer: scorer.last(),
     experimenter: { inFlight: experimenter.isInFlight(), probe: experimenter.current()?.id ?? null },
     openBreakers: admin.openBreakers(),
+    planner: state.get().plan ? { options: state.get().plan.options.length, effectiveConfidence: state.get().plan.effectiveConfidence, recommended: state.get().plan.recommendedOptionId } : null,
     state: state.get(),
   });
 });
@@ -104,12 +107,31 @@ state.subscribe((current) => {
 const detector = createDetector();
 const scorer = createScorer();
 const experimenter = createExperimenter({ windowMs: tuning.collector.windowMs });
+const planner = createPlanner();
 
 // POST /reset must be able to stop an experiment from any state.
 state.onProbeAbort(() => experimenter.abort());
 
 // Kicked off from the detector tick but deliberately NOT awaited: a probe takes seconds,
 // and detection must keep running throughout. Telemetry never stalls behind an experiment.
+// The Planner describes; it never acts. Execution is the Executor's, behind the approval
+// gate the plan itself declares.
+async function replan(probeResult) {
+  const current = state.get();
+  if (!current.incident) return;
+  const [newest] = telemetry.recent(1);
+  const run = await supervisor.run('planner', () => planner.build({
+    incident: current.incident,
+    hypotheses: current.hypotheses,
+    probeResult,
+    observationConfidence: newest?.observationConfidence,
+  }));
+  if (!run.ok) return;
+  state.update({ plan: run.value }, run.value
+    ? `planner: ${run.value.options.length} options, effConf ${run.value.effectiveConfidence}, recommending ${run.value.recommendedOptionId || 'nothing'}`
+    : 'planner: no supported action');
+}
+
 function maybeExperiment(incident, ranked, window) {
   if (!ranked.ambiguous || experimenter.isInFlight()) return;
 
@@ -133,6 +155,7 @@ function maybeExperiment(incident, ranked, window) {
       { probe: { ...probe, phase: result?.inconclusive ? 'inconclusive' : 'measured', result }, hypotheses },
       `probe ${probe.id} ${result?.matched || 'INCONCLUSIVE'} (${result?.measuredDeltaPct}%)`
     );
+    replan(result);
   });
 }
 
@@ -156,6 +179,7 @@ supervisor.startInterval('detector', tuning.collector.windowMs, async () => {
     `${ranked.value.ambiguous ? ' (AMBIGUOUS)' : ''}`);
 
   maybeExperiment(incident, ranked.value, newest);
+  replan(state.get().probe?.result ?? null);
 });
 
 telemetry.start();
