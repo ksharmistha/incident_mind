@@ -16,7 +16,7 @@
     "poolSize": 64,
     "queueMax": 500,
     "serviceTimeMs": 20,
-    "compactionServiceTimeMs": 45
+    "compactionServiceTimeMs": 110
   },
   "collector": {
     "queueMax": 20000,

@@ -153,6 +153,26 @@ a live mesh at 40 VUs: ~12 s baseline, ~20 s ignoring the `shedLevel` in the 202
 it via `applyShed`, ~12 s recovery — subscribing to `ws://127.0.0.1:4100/stream` throughout and
 validating each aggregate with `validateWindowAggregate`.
 
+### No recorded cascade fixtures exist
+
+`fixtures/` is empty, and that is a statement of fact rather than an oversight.
+
+`tools/physics-cascade.js` records every WindowAggregate it observes, so producing
+`cascade-f1.jsonl` and `cascade-f2.jsonl` is a single command. What blocks it is that every
+run which actually produces an incident loses a process to the `3221226505` abort before
+enough windows accumulate: F1 at 100, 120 and 140 virtual users, and F2 at 120, each ended
+with the gateway or the datastore gone. At 80 virtual users the mesh survives comfortably
+but the knee is never crossed, so the recording contains no incident at all.
+
+Two partial recordings of 14 windows each were produced and then **deleted deliberately**.
+They captured the moments before the process died — amplification just reaching x1.50, no
+checkout degradation — and a fixture that looks real but contains no incident is worse than
+no fixture, because a scorer calibrated against it would be calibrated against nothing.
+
+The consequence is that the control plane's scorer has never been calibrated against
+measured data, only against the synthetic development generator, and `tools/calibrate.js`
+labels every such run PROVISIONAL for exactly this reason.
+
 ### Known gap between this harness and the demo
 
 The demo's opening beat raises virtual users from 40 to 200. That produces roughly 1,900 events per

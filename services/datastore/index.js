@@ -1,6 +1,6 @@
 'use strict';
 
-const { startService, burnCpu } = require('../_shared/service');
+const { startService } = require('../_shared/service');
 const { Semaphore } = require('../../packages/util/semaphore');
 const tuning = require('../../config/tuning.json');
 
@@ -33,23 +33,23 @@ let lastWindow = { arrivalRate: 0, serviceTimeMs: serviceTimeMs, utilisation: 0 
 
 // TASK #7 (handoff #10) — the F2 compaction branch.
 //
-// Compaction makes every query more expensive. The extra cost is split deliberately: the
-// service interval rises from serviceTimeMs to compactionServiceTimeMs, and a slice of it
-// is burned as real CPU inside the query handler, because a compacting store genuinely
-// competes for the CPU as well as holding its connection longer.
+// Compaction raises this store's service time from serviceTimeMs to
+// compactionServiceTimeMs. That is the whole fault: each query occupies its connection
+// for longer, so the pool drains more slowly and utilisation rises.
 //
-// F2 must be observationally similar to F1 from the outside — pool saturated, auth slow,
-// retries amplified, bystanders failing — and differ only in where auth's time goes.
-// Under F2 auth's downstreamP99 rises while its selfP99 stays flat, which is exactly the
-// discriminator the causal probe measures.
-const COMPACTION_CPU_SHARE = 0.2;
-
+// A share of the interval was briefly burned as real CPU on the theory that a compacting
+// store also competes for the processor. Measurement killed that idea: burning inside the
+// query handler saturates this service's event loop, which stretches EVERY awaited
+// interval, and the measured service time went to 562ms against a configured 45ms with
+// utilisation swinging between 0.99 and 2.77. The fault has to be a service-time change
+// and nothing else, or it stops being the thing the specification describes.
+//
+// F2 must look like F1 from the outside — pool saturated, auth slow, retries amplified,
+// bystanders failing — and differ only in where auth's time goes. Under F2 auth's
+// downstreamP99 rises while its selfP99 stays flat, which is the discriminator the causal
+// probe measures.
 function currentServiceTimeMs() {
   return compaction ? compactionServiceTimeMs : serviceTimeMs;
-}
-
-function currentCpuBurnMs() {
-  return compaction ? compactionServiceTimeMs * COMPACTION_CPU_SHARE : 0;
 }
 
 startService({
@@ -63,9 +63,7 @@ startService({
       await pool.acquire();
       const startedService = performance.now();
       try {
-        const cpuMs = currentCpuBurnMs();
-        if (cpuMs > 0) burnCpu(cpuMs);
-        await serviceInterval(Math.max(0, currentServiceTimeMs() - cpuMs));
+        await serviceInterval(currentServiceTimeMs());
       } finally {
         serviceTimeTotal += performance.now() - startedService;
         serviceTimeCount++;

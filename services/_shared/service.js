@@ -39,11 +39,29 @@ function startService({ svc, routes, chaos, admin, health, op, resource }) {
     });
   });
 
+  // Handlers receive the emitter and counters so an admin action can put its own pri-0
+  // marker on the telemetry stream — a probe that nothing can see is not an experiment.
+  const ctx = { emitter, counters };
   for (const [name, handler] of Object.entries(chaos)) {
-    app.post(`/chaos/${name}`, async (req, res) => res.json(await handler(req.body ?? {})));
+    app.post(`/chaos/${name}`, async (req, res) => res.json(await handler(req.body ?? {}, ctx)));
   }
   for (const [name, handler] of Object.entries(admin)) {
-    app.post(`/admin/${name}`, async (req, res) => res.json(await handler(req.body ?? {})));
+    app.post(`/admin/${name}`, async (req, res) => res.json(await handler(req.body ?? {}, ctx)));
+  }
+
+  // Every service answers /admin/restart. The control plane's Planner may target any
+  // service with a restart, so a missing route would surface as EXECUTION_FAILED on a
+  // plan the operator had already approved.
+  //
+  // This clears the service's in-memory state — which is what a restart achieves here,
+  // since none of these processes hold anything on disk. It is not a process respawn;
+  // docs/REAL-VS-SIMULATED.md says so plainly rather than letting the name imply more.
+  if (!admin.restart) {
+    app.post('/admin/restart', async (req, res) => {
+      const cleared = chaos.reset ? await chaos.reset({}, ctx) : { ok: true };
+      console.log(`admin: restart — in-memory state cleared`);
+      res.json({ ok: true, svc, restarted: 'state', at: Date.now(), cleared });
+    });
   }
 
   routes(app, { emitter, counters });
@@ -100,7 +118,7 @@ function callJson(url, body, timeoutMs) {
       clearTimeout(timer);
       // A failed attempt still consumed real downstream time; excluding it would inflate
       // selfMs during exactly the incident we are trying to measure.
-      recordDownstream(performance.now() - startedAt);
+      recordDownstream(startedAt, performance.now());
       // A missed deadline is an upstream failure, not a bug in this service. It has to
       // surface as 503 or the error rate blames the caller for its dependency's outage —
       // and blaming the wrong service is precisely the mistake the scorer must not make.
@@ -131,7 +149,7 @@ function callJson(url, body, timeoutMs) {
           if (settled) return;
           settled = true;
           clearTimeout(timer);
-          recordDownstream(performance.now() - startedAt);
+          recordDownstream(startedAt, performance.now());
           let parsed = {};
           try {
             parsed = JSON.parse(Buffer.concat(chunks).toString('utf8'));
@@ -143,9 +161,12 @@ function callJson(url, body, timeoutMs) {
       }
     );
 
-    // One deadline covering connect, send and body read, matching the AbortSignal this
-    // replaces. Destroying the request also destroys its socket, so a half-read
-    // connection is never handed back to the keep-alive pool.
+    // One deadline covering connect, send and body read. Destroying the request also
+    // destroys its socket, so a half-read connection is never handed back to the
+    // keep-alive pool.
+    //
+    // Settling the caller without destroying the socket was tried as a fix for the
+    // 3221226505 process aborts and did not help, so this stays as the simpler behaviour.
     timer = setTimeout(() => {
       timedOut = true;
       req.destroy(new Error(`deadline ${timeoutMs}ms exceeded`));

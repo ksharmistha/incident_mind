@@ -22,10 +22,36 @@ const { AsyncLocalStorage } = require('node:async_hooks');
 
 const store = new AsyncLocalStorage();
 
-// Called by the shared HTTP client for every outbound attempt.
-function recordDownstream(ms) {
+// Called by the shared HTTP client for every outbound attempt, with the interval the call
+// actually occupied.
+//
+// Intervals rather than a running sum, because the gateway issues auth and checkout
+// concurrently: adding their durations would charge the request for 300ms of waiting when
+// it only ever waited 150ms, and selfMs would go negative. What selfMs means is "time this
+// service was NOT waiting on anything downstream", so what has to be subtracted is the
+// union of the downstream intervals, not their sum.
+function recordDownstream(startedAt, endedAt) {
   const ctx = store.getStore();
-  if (ctx) ctx.downstreamMs += ms;
+  if (ctx) ctx.intervals.push([startedAt, endedAt]);
+}
+
+// Total wall-clock time during which at least one downstream call was outstanding.
+function unionMs(intervals) {
+  if (intervals.length === 0) return 0;
+  const sorted = [...intervals].sort((a, b) => a[0] - b[0]);
+  let total = 0;
+  let [start, end] = sorted[0];
+  for (let i = 1; i < sorted.length; i++) {
+    const [s, e] = sorted[i];
+    if (s > end) {
+      total += end - start;
+      start = s;
+      end = e;
+    } else if (e > end) {
+      end = e;
+    }
+  }
+  return total + (end - start);
 }
 
 function currentContext() {
@@ -37,15 +63,15 @@ function currentContext() {
 function middleware({ emitter, counters, op }) {
   return (req, res, next) => {
     const started = performance.now();
-    const ctx = { downstreamMs: 0 };
+    const ctx = { intervals: [] };
     counters.inflight++;
 
     res.on('finish', () => {
       const totalMs = performance.now() - started;
-      // Clamped at zero: clock jitter across many small measurements can otherwise push
-      // the sum of downstream times a hair above the total and produce a negative selfMs,
-      // which would fail contract validation for a rounding artefact.
-      const selfMs = Math.max(0, totalMs - ctx.downstreamMs);
+      // Clamped so a downstream call that outlives the response by a fraction of a
+      // millisecond cannot produce a negative selfMs from a rounding artefact.
+      const downstreamMs = Math.min(totalMs, unionMs(ctx.intervals));
+      const selfMs = Math.max(0, totalMs - downstreamMs);
       counters.inflight--;
       counters.request(res.statusCode);
 
@@ -55,7 +81,7 @@ function middleware({ emitter, counters, op }) {
         op: typeof op === 'function' ? op(req) : op,
         totalMs: Number(totalMs.toFixed(3)),
         selfMs: Number(selfMs.toFixed(3)),
-        downstreamMs: Number(ctx.downstreamMs.toFixed(3)),
+        downstreamMs: Number(downstreamMs.toFixed(3)),
         status: res.statusCode,
       });
     });

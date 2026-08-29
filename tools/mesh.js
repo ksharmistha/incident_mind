@@ -19,7 +19,16 @@ const PROCESSES = [
   { name: 'auth', script: 'services/auth/index.js', colour: 33 },
   { name: 'gateway', script: 'services/gateway/index.js', colour: 32 },
   { name: 'collector', script: 'collector/server.js', colour: 95 },
+  // The control plane starts last: it retries its collector connection with backoff, so
+  // ordering is a convenience rather than a requirement, but starting it after the thing
+  // it subscribes to keeps the boot log readable.
+  { name: 'control', script: 'control/server.js', colour: 96 },
   { name: 'loadgen', script: 'loadgen/index.js', colour: 90 },
+  // The console is Vite's dev server. Started the same way as everything else — a direct
+  // node child running vite's own entry script, never through a shell — so Ctrl-C takes it
+  // down with the rest and argument quoting cannot break on a path containing spaces.
+  // Its /health is proxied through to the control plane, so the READY check works unchanged.
+  { name: 'console', script: 'console/node_modules/vite/bin/vite.js', cwd: 'console', colour: 94 },
 ];
 
 const root = path.join(__dirname, '..');
@@ -40,7 +49,7 @@ function prefix(name, colour, stream, line) {
 
 function start(proc) {
   const child = spawn(process.execPath, [path.join(root, proc.script)], {
-    cwd: root,
+    cwd: proc.cwd ? path.join(root, proc.cwd) : root,
     stdio: ['ignore', 'pipe', 'pipe'],
     env: process.env,
   });

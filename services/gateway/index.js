@@ -1,7 +1,7 @@
 'use strict';
 
 const { startService, callJson } = require('../_shared/service');
-const { PORTS } = require('../../packages/contracts');
+const { PORTS, MAX_PROBE_FRACTION, MAX_PROBE_DURATION_MS } = require('../../packages/contracts');
 const tuning = require('../../config/tuning.json');
 
 // The gateway is the amplification source. It is not misbehaving: a short deadline plus
@@ -42,7 +42,57 @@ let lastWindow = { auth: { calls: 0, attempts: 0, amplification: 0, timeouts: 0 
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
+// Circuit breaker per upstream. Both a failure mechanism and a recovery action: opening
+// the breaker on auth is how the control plane isolates a bad dependency, which frees the
+// datastore permits auth was consuming.
+const breakers = { auth: false, checkout: false };
+
+// Probe shed. Drop a bounded fraction of calls to one upstream for a bounded time, serving
+// a degraded response instead. The timer that ends it lives HERE, on the server, so the
+// probe expires even if the control plane dies mid-experiment. That auto-expiry is the
+// safety property that makes probing a live system defensible, and it is worth saying out
+// loud on stage.
+const probeShed = { auth: null, checkout: null };
+
+function endProbe(name, emitter, reason) {
+  const active = probeShed[name];
+  if (!active) return;
+  clearTimeout(active.timer);
+  probeShed[name] = null;
+  emitter?.enqueue({ pri: 0, kind: 'probe', probeId: active.probeId, phase: 'end' });
+  console.log(`admin: probe ${active.probeId} ENDED on ${name} (${reason})`);
+}
+
+function startProbe({ probeId, upstream, fraction, durationMs }, emitter) {
+  // Clamped to the contract's rails. The control plane clamps too; both sides do it so
+  // neither can be widened by trusting the other.
+  const safeFraction = Math.min(Math.max(fraction, 0), MAX_PROBE_FRACTION);
+  const safeDuration = Math.min(Math.max(durationMs, 0), MAX_PROBE_DURATION_MS);
+
+  endProbe(upstream, emitter, 'superseded');
+  const timer = setTimeout(() => endProbe(upstream, emitter, 'auto-expired'), safeDuration);
+  probeShed[upstream] = { probeId, fraction: safeFraction, timer, startedAt: Date.now(), durationMs: safeDuration };
+
+  emitter?.enqueue({ pri: 0, kind: 'probe', probeId, phase: 'start' });
+  console.log(`admin: probe ${probeId} STARTED — shedding ${safeFraction} of ${upstream} calls for ${safeDuration}ms`);
+  return { ok: true, probeId, upstream, fraction: safeFraction, durationMs: safeDuration, expiresAt: Date.now() + safeDuration };
+}
+
 async function callUpstream(name, body) {
+  if (breakers[name]) {
+    const err = new Error(`${name} breaker is open`);
+    err.status = 503;
+    err.code = 'BREAKER_OPEN';
+    throw err;
+  }
+
+  // Shed decided before the counters move: a call we deliberately never made is not a
+  // call, so amplification stays attempts/calls over the calls actually attempted.
+  const shed = probeShed[name];
+  if (shed && Math.random() < shed.fraction) {
+    return { status: 200, body: { degraded: true, probeId: shed.probeId, upstream: name } };
+  }
+
   const limit = bulkhead[name];
   if (limit !== undefined && inFlight[name] >= limit) {
     const err = new Error(`${name} bulkhead full (${limit} in flight)`);
@@ -121,15 +171,49 @@ startService({
   },
 
   chaos: {
-    reset: () => {
+    reset: (_body, { emitter } = {}) => {
       for (const c of Object.values(counters)) Object.assign(c, { calls: 0, attempts: 0, timeouts: 0 });
+      for (const name of Object.keys(breakers)) breakers[name] = false;
+      for (const name of Object.keys(probeShed)) endProbe(name, emitter, 'reset');
       return { ok: true };
     },
   },
 
-  admin: {},
+  admin: {
+    // Isolate an upstream. Reversible, which is why the Planner may run it autonomously.
+    breaker: ({ upstream, open }) => {
+      if (!(upstream in breakers)) throw Object.assign(new Error(`unknown upstream "${upstream}"`), { status: 400, code: 'UNKNOWN_UPSTREAM' });
+      breakers[upstream] = open !== false;
+      console.log(`admin: breaker on ${upstream} ${breakers[upstream] ? 'OPEN' : 'closed'}`);
+      return { ok: true, upstream, open: breakers[upstream] };
+    },
 
-  health: () => ({ inFlight: { ...inFlight }, window: lastWindow }),
+    probe: ({ probeId, action, upstream, fraction, durationMs }, { emitter } = {}) => {
+      if (action !== 'shed') throw Object.assign(new Error(`unsupported probe action "${action}"`), { status: 400, code: 'UNSUPPORTED_ACTION' });
+      if (!(upstream in probeShed)) throw Object.assign(new Error(`unknown upstream "${upstream}"`), { status: 400, code: 'UNKNOWN_UPSTREAM' });
+      if (breakers[upstream]) throw Object.assign(new Error(`breaker already open on ${upstream}`), { status: 409, code: 'BREAKER_OPEN' });
+      // One probe in flight per upstream; a second one supersedes the first rather than
+      // stacking two sheds on the same edge.
+      return startProbe({ probeId, upstream, fraction, durationMs }, emitter);
+    },
+
+    restart: (_body, { emitter } = {}) => {
+      for (const c of Object.values(counters)) Object.assign(c, { calls: 0, attempts: 0, timeouts: 0 });
+      for (const name of Object.keys(breakers)) breakers[name] = false;
+      for (const name of Object.keys(probeShed)) endProbe(name, emitter, 'restart');
+      console.log('admin: restart — in-memory state cleared');
+      return { ok: true, svc: 'gateway', restarted: 'state', at: Date.now() };
+    },
+  },
+
+  health: () => ({
+    inFlight: { ...inFlight },
+    window: lastWindow,
+    breakers: { ...breakers },
+    faults: Object.entries(breakers).filter(([, open]) => open).map(([n]) => `breaker:${n}`),
+    probes: Object.fromEntries(Object.entries(probeShed).filter(([, p]) => p)
+      .map(([n, p]) => [n, { probeId: p.probeId, fraction: p.fraction, msRemaining: Math.max(0, p.startedAt + p.durationMs - Date.now()) }])),
+  }),
 });
 
 // Amplification, visible in the logs before any pipeline exists, and readable over
