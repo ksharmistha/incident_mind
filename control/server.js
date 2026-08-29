@@ -19,6 +19,7 @@ const state = require('./state');
 const supervisor = require('./supervisor');
 const telemetry = require('./adapters/telemetry');
 const { createDetector } = require('./agents/detector');
+const { createScorer } = require('./agents/scorer');
 const { PORTS, validationEnabled } = require('./adapters/contracts');
 const { tuning, control, derived } = require('./adapters/tuning');
 
@@ -36,6 +37,7 @@ app.post('/reset', (req, res) => {
   const cleared = state.reset();
   telemetry.clear();
   detector.reset();
+  scorer.reset();
   supervisor.resetStats();
   res.json({ ok: true, cleared });
 });
@@ -65,6 +67,7 @@ app.get('/debug/status', (req, res) => {
     telemetry: telemetry.status(),
     supervisor: supervisor.stats(),
     detector: detector.stats(),
+    scorer: scorer.last(),
     state: state.get(),
   });
 });
@@ -93,8 +96,9 @@ state.subscribe((current) => {
 // It is deliberately not driven by the telemetry callback: detection must keep running at
 // its own cadence even while everything downstream is waiting on a human approval.
 const detector = createDetector();
+const scorer = createScorer();
 
-supervisor.startInterval('detector', tuning.collector.windowMs, () => {
+supervisor.startInterval('detector', tuning.collector.windowMs, async () => {
   // Every window since the detector's cursor, not just the newest: the detector runs on
   // its own clock and must not lose EWMA samples when the two cadences drift.
   let incident = null;
@@ -103,6 +107,15 @@ supervisor.startInterval('detector', tuning.collector.windowMs, () => {
   }
   if (!incident) return;
   state.update({ incident }, `detector: ${incident.id} @ window ${incident.lastWindowId}`);
+
+  // Diagnosis follows detection in the same tick. The Scorer is pure, so it re-ranks from
+  // scratch every window rather than carrying a verdict forward.
+  const [newest] = telemetry.recent(1);
+  const ranked = await supervisor.run('scorer', () => scorer.score(incident, newest));
+  if (!ranked.ok) return;
+  state.update({ hypotheses: ranked.value.hypotheses },
+    `scorer: ${ranked.value.hypotheses.length} hypotheses, margin ${ranked.value.margin}` +
+    `${ranked.value.ambiguous ? ' (AMBIGUOUS)' : ''}`);
 });
 
 telemetry.start();

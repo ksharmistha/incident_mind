@@ -43,6 +43,12 @@ const derived = {
   // change what counts as abnormal.
   baselineWarmupWindows: 10,
 
+  // temporalPrecedence decays with lag. Short on purpose: §10.3 says precedence within
+  // one or two windows is unreliable under a fast ramp, so services that degrade within a
+  // few seconds of each other must score near-equally instead of the earliest taking all
+  // the weight. This shapes the term's response, it is not a pass/fail threshold.
+  precedenceDecaySeconds: 5,
+
   // Probe measurement windows, §11.2 steps 4 and 6.
   probeBaselineWindows: 2,
   probeSettlingWindows: 2,
