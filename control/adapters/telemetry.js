@@ -11,9 +11,9 @@
 // first several hours of the build and must never crash the control plane.
 
 const WebSocket = require('ws');
-const { check } = require('./contracts');
+const { check, PORTS } = require('./contracts');
 
-const DEFAULT_URL = process.env.IM_COLLECTOR_URL || 'ws://127.0.0.1:4100/stream';
+const DEFAULT_URL = process.env.IM_COLLECTOR_URL || `ws://127.0.0.1:${PORTS.collector}/stream`;
 const RING_SIZE = 120;               // ~2 minutes of 1 Hz windows
 const RECONNECT_MIN_MS = 500;
 const RECONNECT_MAX_MS = 5000;

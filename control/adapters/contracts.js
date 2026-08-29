@@ -2,55 +2,53 @@
 
 // The single import point for contract shapes and validators.
 //
-// Every agent requires this file, never packages/contracts or control/dev directly, so
-// swapping the temporary stand-in for P1's frozen module is a one-line change here.
+// Every agent requires this file rather than packages/contracts directly, so the frozen
+// module has exactly one entry point into the control plane. That is also what made the
+// switch away from the development stand-in a one-file change.
 //
-// Two assumptions live in the stand-in's validators and are flagged for integration:
-//   A1  pipeline.lateDropped is OPTIONAL. All three PDFs mandate the counter and P1's
-//       judge Q&A says it is published, but it is absent from the formal WindowAggregate
-//       shape in all three. Accepted when present, never required, never read by an agent.
-//   A2  observationTerms.* are normalised unweighted fractions in [0,1], with
-//       watermarkLag = min(1, pipeline.watermarkLagMs / 5000). Evidence: the paired
-//       IngestAck example carries watermarkLagMs 900, and 900/5000 is exactly the printed
-//       0.18; raw ms is impossible because the watermark is defined as max(t) - 2000ms.
+// The frozen module offers two tiers (its own section header says so):
+//   xProblems(obj)  pure, always runs, returns problem strings
+//   validateX(obj)  gated on IM_VALIDATE=1, returns a boolean, logs loudly, never throws
+// The request path uses the gated tier; harnesses and tests use the pure tier.
 
-const path = require('path');
+const contracts = require('../../packages/contracts');
 
-const REAL = path.join(__dirname, '..', '..', 'packages', 'contracts', 'index.js');
-const DEV = path.join(__dirname, '..', 'dev', 'contracts-local.js');
-
-let source = REAL;
-let contracts;
-try {
-  contracts = require(REAL);
-} catch {
-  source = DEV;
-  contracts = require(DEV);
-}
-
-const usingRealContracts = source === REAL;
-const VALIDATE = process.env.IM_VALIDATE === '1';
-
-console.log(
-  `[contracts] using ${usingRealContracts ? 'packages/contracts (FROZEN)' : 'control/dev/contracts-local.js (TEMPORARY STAND-IN)'}` +
-  `, IM_VALIDATE=${VALIDATE ? '1' : '0'}`
-);
-
-// A validation failure logs loudly with the offending object. It never throws in the
-// request path - P1 handoff section 8.6.
+// Returns true when the object is valid or validation is off. Never throws, so a bad
+// object can never become an outage in the system whose outages we are observing.
 function check(kind, value) {
-  if (!VALIDATE) return true;
-  const validator = contracts['validate' + kind];
-  if (typeof validator !== 'function') {
-    console.warn(`[contracts] no validate${kind} in the active contracts module`);
+  const validate = contracts['validate' + kind];
+  if (typeof validate !== 'function') {
+    console.warn(`[contracts] no validate${kind} in packages/contracts`);
     return true;
   }
-  const problems = validator(value);
-  if (problems.length === 0) return true;
-  console.error(`[contracts] ${kind} FAILED VALIDATION (${problems.length}):`);
-  for (const p of problems) console.error(`  - ${p}`);
-  console.error('  offending object:', JSON.stringify(value));
-  return false;
+  return validate(value);
 }
 
-module.exports = { ...contracts, check, usingRealContracts, VALIDATE };
+// Returns the problem strings regardless of IM_VALIDATE. For tests and harnesses.
+function problems(kind, value) {
+  const fn = contracts[kind.charAt(0).toLowerCase() + kind.slice(1) + 'Problems'];
+  return typeof fn === 'function' ? fn(value) : [];
+}
+
+// Edge keys are the only place the contract records an edge's direction — the edge object
+// itself carries no from/to — so the scorer's amplificationTarget and upstreamness terms
+// depend entirely on splitting this key correctly. Getting it wrong zeroes two of four
+// terms silently rather than loudly.
+//
+// The contract requires U+2192 and P1's validator checks for it, but it permits
+// surrounding whitespace, and the runbook renders the key spaced. Split tolerantly.
+function parseEdgeKey(key) {
+  if (typeof key !== 'string') return null;
+  const parts = key.split(/\s*(?:→|->|=>)\s*/);
+  if (parts.length !== 2) return null;
+  const from = parts[0].trim();
+  const to = parts[1].trim();
+  if (!from || !to) return null;
+  return { from, to };
+}
+
+console.log(
+  `[contracts] packages/contracts (FROZEN), IM_VALIDATE=${contracts.validationEnabled ? '1' : '0'}`
+);
+
+module.exports = { ...contracts, check, problems, parseEdgeKey };

@@ -18,10 +18,10 @@ const { WebSocketServer } = require('ws');
 const state = require('./state');
 const supervisor = require('./supervisor');
 const telemetry = require('./adapters/telemetry');
-const { usingRealContracts, VALIDATE } = require('./adapters/contracts');
-const { usingRealTuning, control, derived } = require('./adapters/tuning');
+const { PORTS, validationEnabled } = require('./adapters/contracts');
+const { control, derived } = require('./adapters/tuning');
 
-const PORT = Number(process.env.IM_CONTROL_PORT || 4200);
+const PORT = Number(process.env.IM_CONTROL_PORT || PORTS.control);
 const HOST = '127.0.0.1';
 
 const app = express();
@@ -57,9 +57,9 @@ app.post('/approve', (req, res) => {
 // Operational visibility for the build. Not part of any contract and not on the demo path.
 app.get('/debug/status', (req, res) => {
   res.json({
-    contracts: usingRealContracts ? 'packages/contracts' : 'control/dev (stand-in)',
-    tuning: usingRealTuning ? 'config/tuning.json' : 'control/dev (provisional)',
-    validate: VALIDATE,
+    contracts: 'packages/contracts (frozen)',
+    tuning: 'config/tuning.json',
+    validate: validationEnabled,
     telemetry: telemetry.status(),
     supervisor: supervisor.stats(),
     state: state.get(),
