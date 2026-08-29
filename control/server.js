@@ -23,6 +23,7 @@ const { createScorer } = require('./agents/scorer');
 const { createExperimenter } = require('./agents/experimenter');
 const { createPlanner } = require('./agents/planner');
 const { createExecutor } = require('./agents/executor');
+const { createVerifier } = require('./agents/verifier');
 const admin = require('./adapters/admin');
 const { PORTS, validationEnabled } = require('./adapters/contracts');
 const { tuning, control, derived } = require('./adapters/tuning');
@@ -45,6 +46,9 @@ app.post('/reset', (req, res) => {
   experimenter.reset();
   planner.reset();
   executor.reset();
+  verifier.reset();
+  verifyCursor = null;
+  verifyDeadline = 0;
   admin.reset();
   supervisor.resetStats();
   res.json({ ok: true, cleared });
@@ -90,6 +94,7 @@ app.get('/debug/status', (req, res) => {
     experimenter: { inFlight: experimenter.isInFlight(), probe: experimenter.current()?.id ?? null },
     openBreakers: admin.openBreakers(),
     executor: executor.stats(),
+    verifier: verifier.status(),
     planner: state.get().plan ? { options: state.get().plan.options.length, effectiveConfidence: state.get().plan.effectiveConfidence, recommended: state.get().plan.recommendedOptionId } : null,
     state: state.get(),
   });
@@ -118,17 +123,68 @@ state.subscribe((current) => {
 // The Detector runs on its own interval, reading the newest closed window from the ring.
 // It is deliberately not driven by the telemetry callback: detection must keep running at
 // its own cadence even while everything downstream is waiting on a human approval.
+let verifyCursor = null;
+let verifyDeadline = 0;
+
 const detector = createDetector();
 const scorer = createScorer();
 const experimenter = createExperimenter({ windowMs: tuning.collector.windowMs });
 const planner = createPlanner();
 const executor = createExecutor();
+const verifier = createVerifier();
 
 // POST /reset must be able to stop an experiment from any state.
 state.onProbeAbort(() => experimenter.abort());
 
 // Kicked off from the detector tick but deliberately NOT awaited: a probe takes seconds,
 // and detection must keep running throughout. Telemetry never stalls behind an experiment.
+// An APPLIED action is a claim that the data plane accepted an instruction. Whether
+// anything actually got better is a separate question, answered only by telemetry — so the
+// Verifier starts here and reads nothing from the record but which action to watch.
+function beginVerification(record) {
+  if (record.outcome !== 'APPLIED') return;
+  const { incident, plan } = state.get();
+  const option = plan?.options.find((o) => o.id === record.optionId);
+  const started = verifier.start({
+    incident, actionRecord: record, predicted: option?.predicted, telemetry,
+  });
+  if (!started.ok) {
+    console.log(`[control] verification not started: ${started.reason}`);
+    // Some refusals are themselves a conclusion — an unverifiable prediction, for
+    // instance. Publish it rather than leaving the console with a silent gap.
+    if (started.verdict) {
+      state.update({ verdict: started.verdict },
+        `verdict ${started.verdict.actionId} ${started.verdict.verdict}: ${started.verdict.reason}`);
+    }
+    return;
+  }
+  verifyCursor = null;
+  verifyDeadline = Date.now() + supervisor.AGENTS.verifier.timeoutMs;
+  state.update({ plan: { ...state.get().plan, verification: started.verification } },
+    `verifying ${record.actionId}`);
+}
+
+// Driven from the telemetry tick rather than a blocking await, so verification cannot stall
+// detection — and a stalled stream ends as INCONCLUSIVE rather than hanging forever.
+function pumpVerification() {
+  if (!verifier.isVerifying()) return;
+  const windows = telemetry.since(verifyCursor);
+  if (windows.length) verifyCursor = windows[windows.length - 1].windowId;
+
+  let verdict = verifier.observe(windows);
+  if (!verdict && Date.now() > verifyDeadline) {
+    verdict = verifier.timeout(`no verdict within the ${supervisor.AGENTS.verifier.timeoutMs}ms verification budget`);
+  }
+  if (verdict) {
+    state.update({ verdict, plan: { ...state.get().plan, verification: null } },
+      `verdict ${verdict.actionId} ${verdict.verdict}: ${verdict.reason}`);
+    return;
+  }
+  const view = verifier.current();
+  if (view) state.update({ plan: { ...state.get().plan, verification: view } },
+    `verifying ${view.actionId} (${view.observed}/${view.needed})`);
+}
+
 // One execution path, whether the trigger was a human approval or the autonomy gate.
 // Runs under the supervisor's executor budget: a hang becomes EXECUTION_FAILED rather
 // than a stalled control plane.
@@ -160,6 +216,7 @@ async function runAction(optionId, why) {
   if (record) {
     state.update({ plan: { ...state.get().plan, executing: null, action: record } },
       `action ${record.actionId} ${record.outcome}`);
+    beginVerification(record);
   } else {
     state.update({ plan: { ...state.get().plan, executing: null } }, `execution refused: ${refusal.reason}`);
   }
@@ -245,6 +302,7 @@ supervisor.startInterval('detector', tuning.collector.windowMs, async () => {
     `${ranked.value.ambiguous ? ' (AMBIGUOUS)' : ''}`);
 
   maybeExperiment(incident, ranked.value, newest);
+  pumpVerification();
   replan(state.get().probe?.result ?? null);
 });
 

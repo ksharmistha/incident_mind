@@ -55,6 +55,17 @@ const derived = {
 
   // The Verifier observes this many windows after an action, §10.5.
   verifyWindows: 10,
+  // Baseline for verification: the windows immediately before the action, mirroring the
+  // probe's two-window convention (§11.2 step 4). One window is a sample, not a baseline.
+  verifyBaselineWindows: 2,
+  // How long a condition must hold before it counts as evidence. Deliberately reuses the
+  // Detector's debounce rather than introducing a second notion of "sustained": one good
+  // window is noise in the same way one bad window is.
+  verifySustainWindows: control.debounceWindows,
+  // Give up and report INCONCLUSIVE if the stream advances this far past the action
+  // without producing enough clean windows. 3x the observation budget tolerates a couple
+  // of gaps without waiting forever on a stream that will never deliver.
+  verifyMaxWindowSpan: 30,
 };
 
 console.log(
