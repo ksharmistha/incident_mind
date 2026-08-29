@@ -10,7 +10,9 @@
   },
   "scripts": {
     "mesh": "node tools/mesh.js",
-    "reset": "node tools/reset.js"
+    "reset": "node tools/reset.js",
+    "control": "node control/server.js",
+    "dev-windows": "node tools/dev-windows.js --dev"
   },
   "dependencies": {
     "dotenv": "^17.4.2",
