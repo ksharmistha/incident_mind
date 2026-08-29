@@ -1,14 +1,22 @@
 {
   "name": "incidentmind-v2",
+  "version": "2.0.0",
   "private": true,
-  "version": "0.0.0",
-  "description": "STAGING MANIFEST - P2 local workspace only. P1 owns the real root package.json; discard this file when the repo arrives.",
+  "type": "commonjs",
+  "description": "A real microservice mesh whose telemetry flows through a back-pressured real-time pipeline that sheds load by priority, driving a control plane that runs bounded reversible experiments when observation is ambiguous.",
+  "license": "UNLICENSED",
+  "engines": {
+    "node": ">=20"
+  },
   "scripts": {
+    "mesh": "node tools/mesh.js",
+    "reset": "node tools/reset.js",
     "control": "node control/server.js",
     "dev-windows": "node tools/dev-windows.js --dev"
   },
   "dependencies": {
-    "express": "^5.1.0",
-    "ws": "^8.18.3"
+    "dotenv": "^17.4.2",
+    "express": "^5.2.1",
+    "ws": "^8.21.3"
   }
 }
