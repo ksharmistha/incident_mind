@@ -20,6 +20,8 @@ const supervisor = require('./supervisor');
 const telemetry = require('./adapters/telemetry');
 const { createDetector } = require('./agents/detector');
 const { createScorer } = require('./agents/scorer');
+const { createExperimenter } = require('./agents/experimenter');
+const admin = require('./adapters/admin');
 const { PORTS, validationEnabled } = require('./adapters/contracts');
 const { tuning, control, derived } = require('./adapters/tuning');
 
@@ -38,6 +40,8 @@ app.post('/reset', (req, res) => {
   telemetry.clear();
   detector.reset();
   scorer.reset();
+  experimenter.reset();
+  admin.reset();
   supervisor.resetStats();
   res.json({ ok: true, cleared });
 });
@@ -68,6 +72,8 @@ app.get('/debug/status', (req, res) => {
     supervisor: supervisor.stats(),
     detector: detector.stats(),
     scorer: scorer.last(),
+    experimenter: { inFlight: experimenter.isInFlight(), probe: experimenter.current()?.id ?? null },
+    openBreakers: admin.openBreakers(),
     state: state.get(),
   });
 });
@@ -97,6 +103,38 @@ state.subscribe((current) => {
 // its own cadence even while everything downstream is waiting on a human approval.
 const detector = createDetector();
 const scorer = createScorer();
+const experimenter = createExperimenter({ windowMs: tuning.collector.windowMs });
+
+// POST /reset must be able to stop an experiment from any state.
+state.onProbeAbort(() => experimenter.abort());
+
+// Kicked off from the detector tick but deliberately NOT awaited: a probe takes seconds,
+// and detection must keep running throughout. Telemetry never stalls behind an experiment.
+function maybeExperiment(incident, ranked, window) {
+  if (!ranked.ambiguous || experimenter.isInFlight()) return;
+
+  supervisor.run('experimenter', () => experimenter.run({
+    hypotheses: ranked.hypotheses,
+    incident,
+    observationConfidence: window?.observationConfidence,
+    telemetry,
+    // Step 3 of §11.2. The probe reaches the console, predictions and timestamp included,
+    // before the intervention fires. Never reorder this.
+    publish: async (probe) => {
+      state.update({ probe: { ...probe, phase: 'published' } }, `probe ${probe.id} PUBLISHED before execution`);
+    },
+  })).then((run) => {
+    if (!run.ok || !run.value || !run.value.probe) return;
+    const { probe, result } = run.value;
+    const hypotheses = state.get().hypotheses.map((h) => (
+      result && result.posteriors[h.id] !== undefined ? { ...h, posterior: result.posteriors[h.id] } : h
+    ));
+    state.update(
+      { probe: { ...probe, phase: result?.inconclusive ? 'inconclusive' : 'measured', result }, hypotheses },
+      `probe ${probe.id} ${result?.matched || 'INCONCLUSIVE'} (${result?.measuredDeltaPct}%)`
+    );
+  });
+}
 
 supervisor.startInterval('detector', tuning.collector.windowMs, async () => {
   // Every window since the detector's cursor, not just the newest: the detector runs on
@@ -116,6 +154,8 @@ supervisor.startInterval('detector', tuning.collector.windowMs, async () => {
   state.update({ hypotheses: ranked.value.hypotheses },
     `scorer: ${ranked.value.hypotheses.length} hypotheses, margin ${ranked.value.margin}` +
     `${ranked.value.ambiguous ? ' (AMBIGUOUS)' : ''}`);
+
+  maybeExperiment(incident, ranked.value, newest);
 });
 
 telemetry.start();

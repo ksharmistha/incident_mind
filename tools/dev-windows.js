@@ -18,7 +18,7 @@
 const http = require('http');
 const { WebSocketServer } = require('ws');
 const {
-  PORTS, SERVICES, windowAggregateProblems,
+  PORTS, SERVICES, windowAggregateProblems, MAX_PROBE_FRACTION, MAX_PROBE_DURATION_MS,
 } = require('../packages/contracts');
 const tuning = require('../config/tuning.json');
 
@@ -30,7 +30,7 @@ const SCENARIOS = ['healthy', 'spike', 'f1', 'f2'];
 
 function parseArgs(argv) {
   const args = { scenario: 'f1', seed: 1, intervalMs: 1000, port: PORTS.collector,
-                 epoch: null, lateDropped: true, maxWindows: Infinity, dev: false };
+                 epoch: null, lateDropped: true, maxWindows: Infinity, dev: false, admin: true };
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i];
     if (a === '--dev') args.dev = true;
@@ -41,6 +41,7 @@ function parseArgs(argv) {
     else if (a === '--epoch') args.epoch = Number(argv[++i]);
     else if (a === '--windows') args.maxWindows = Number(argv[++i]);
     else if (a === '--omit-late-dropped') args.lateDropped = false;
+    else if (a === '--no-admin') args.admin = false;
     else { console.error(`unknown argument ${a}`); process.exit(2); }
   }
   return args;
@@ -347,6 +348,115 @@ function buildService(svc, ctx) {
 }
 
 // ---------------------------------------------------------------------------
+// Mock /admin/* surface.
+//
+// Stands in for P1's services until they exist. It answers the same four admin routes on
+// the same ports, so control/adapters/admin.js cannot tell the difference and needs no
+// change at integration.
+//
+// The probe response is the part that matters: shedding a fraction of an upstream's calls
+// unloads that service. Under a self-side fault the relief is large, because the service's
+// own event loop was the constraint. Under a downstream fault it is small, because self
+// time was never the constraint. Those two magnitudes are what the Experimenter measures.
+// They are SHAPED, not simulated — no threshold derived against them means anything until
+// it is re-measured against the real mesh.
+// ---------------------------------------------------------------------------
+
+const activeProbe = { probeId: null, upstream: null, fraction: 0, expiresAt: 0, timer: null };
+
+function probeActive() {
+  return activeProbe.probeId !== null && Date.now() < activeProbe.expiresAt;
+}
+
+// Relief in auth's own service time, as a fraction of the shed traffic.
+function selfReliefFactor(scenario, fraction) {
+  if (!probeActive()) return 1;
+  const shed = Math.min(fraction, MAX_PROBE_FRACTION) / MAX_PROBE_FRACTION;   // 0..1
+  // f1: the event loop unsaturates and self time collapses.
+  // f2: self time was never the constraint, so removing load barely moves it.
+  const maxRelief = scenario === 'f1' ? 0.65 : 0.08;
+  return 1 - maxRelief * shed;
+}
+
+function endProbe(reason) {
+  if (activeProbe.timer) clearTimeout(activeProbe.timer);
+  if (activeProbe.probeId) console.log(`[dev-windows] probe ${activeProbe.probeId} ended (${reason})`);
+  activeProbe.probeId = null;
+  activeProbe.upstream = null;
+  activeProbe.fraction = 0;
+  activeProbe.expiresAt = 0;
+  activeProbe.timer = null;
+}
+
+function readJson(req) {
+  return new Promise((resolve) => {
+    let body = '';
+    req.on('data', (c) => { body += c; });
+    req.on('end', () => { try { resolve(JSON.parse(body || '{}')); } catch { resolve({}); } });
+  });
+}
+
+function adminHandler(svc, args) {
+  return async (req, res) => {
+    const send = (code, obj) => {
+      res.writeHead(code, { 'content-type': 'application/json' });
+      res.end(JSON.stringify(obj));
+    };
+    if (req.url === '/health') {
+      return send(200, { svc, up: true, version: '2.4.1', faults: [], synthetic: true });
+    }
+    if (req.url.startsWith('/chaos/')) {
+      // Present so that a control plane wrongly calling it is caught loudly here rather
+      // than silently succeeding.
+      console.error(`[dev-windows] !! ${svc} received a /chaos/ call from the control plane: ${req.url}`);
+      return send(403, { error: 'chaos endpoints are operator-only' });
+    }
+    if (req.method !== 'POST') return send(405, { error: 'method not allowed' });
+
+    const body = await readJson(req);
+
+    if (req.url === '/admin/probe') {
+      if (probeActive()) {
+        return send(409, { error: 'a probe is already in flight', probeId: activeProbe.probeId });
+      }
+      const fraction = Number(body.fraction);
+      const durationMs = Number(body.durationMs);
+      if (!(fraction > 0) || fraction > MAX_PROBE_FRACTION) {
+        return send(400, { error: `fraction must be in (0, ${MAX_PROBE_FRACTION}]`, got: body.fraction });
+      }
+      if (!(durationMs > 0) || durationMs > MAX_PROBE_DURATION_MS) {
+        return send(400, { error: `durationMs must be in (0, ${MAX_PROBE_DURATION_MS}]`, got: body.durationMs });
+      }
+      activeProbe.probeId = String(body.probeId || 'P?');
+      activeProbe.upstream = String(body.upstream || '');
+      activeProbe.fraction = fraction;
+      activeProbe.expiresAt = Date.now() + durationMs;
+      // Server-side expiry. The probe ends on its own even if the control plane dies
+      // mid-experiment — the safety property that makes probing defensible.
+      activeProbe.timer = setTimeout(() => endProbe('server-side auto-expiry'), durationMs);
+      console.log(`[dev-windows] probe ${activeProbe.probeId}: shed ${fraction} of ${svc}->${activeProbe.upstream} for ${durationMs}ms`);
+      return send(200, { ok: true, probeId: activeProbe.probeId, expiresAt: activeProbe.expiresAt });
+    }
+    if (req.url === '/admin/version') return send(200, { ok: true, svc, version: body.version });
+    if (req.url === '/admin/breaker') return send(200, { ok: true, svc, upstream: body.upstream, open: !!body.open });
+    if (req.url === '/admin/restart') return send(200, { ok: true, svc, restarted: true });
+    return send(404, { error: 'not an admin route' });
+  };
+}
+
+function startAdminMocks(args) {
+  const servers = [];
+  for (const svc of SERVICES) {
+    const server = http.createServer(adminHandler(svc, args));
+    server.on('error', (e) => console.error(`[dev-windows] admin ${svc}: ${e.message}`));
+    server.listen(PORTS[svc], '127.0.0.1');
+    servers.push(server);
+  }
+  console.log(`[dev-windows] mock /admin/* on ${SERVICES.map((s) => PORTS[s]).join(', ')}`);
+  return servers;
+}
+
+// ---------------------------------------------------------------------------
 // Server
 // ---------------------------------------------------------------------------
 
@@ -359,6 +469,7 @@ function start(args) {
     res.end(JSON.stringify({ svc: 'dev-windows', up: true, synthetic: true, ...opts }));
   });
   const wss = new WebSocketServer({ server, path: '/stream' });
+  const adminServers = args.admin ? startAdminMocks(args) : [];
 
   let n = 0;
   let invalid = 0;
@@ -372,6 +483,18 @@ function start(args) {
   const timer = setInterval(() => {
     if (n >= args.maxWindows) { clearInterval(timer); shutdown(); return; }
     const w = buildWindow(n, opts);
+
+    // A probe in flight relieves the shed upstream's own service time. Applied here rather
+    // than inside buildWindow so the pure builder stays a function of (n, opts) alone.
+    if (probeActive() && w.services[activeProbe.upstream]) {
+      const svc = w.services[activeProbe.upstream];
+      const factor = selfReliefFactor(opts.scenario, activeProbe.fraction);
+      svc.selfP99 = round1(svc.selfP99 * factor);
+      svc.p99 = round1(svc.selfP99 + svc.downstreamP99);
+      svc.p95 = round1(svc.p99 * 0.72);
+      svc.p50 = round1(svc.p99 * 0.30);
+      w.probeActive = activeProbe.probeId;
+    }
 
     // The generator validates its own output against the frozen contract. A synthetic
     // source that emits an invalid aggregate would send the control plane chasing a bug
@@ -402,7 +525,9 @@ function start(args) {
   function shutdown() {
     console.log(`[dev-windows] stopping after ${n} windows (${invalid} invalid)`);
     clearInterval(timer);
+    endProbe('shutdown');
     for (const ws of wss.clients) ws.close();
+    for (const s of adminServers) s.close();
     server.close(() => process.exit(invalid === 0 ? 0 : 1));
     setTimeout(() => process.exit(invalid === 0 ? 0 : 1), 500).unref();
   }
