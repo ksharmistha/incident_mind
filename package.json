@@ -1,0 +1,20 @@
+{
+  "name": "incidentmind-v2",
+  "version": "2.0.0",
+  "private": true,
+  "type": "commonjs",
+  "description": "A real microservice mesh whose telemetry flows through a back-pressured real-time pipeline that sheds load by priority, driving a control plane that runs bounded reversible experiments when observation is ambiguous.",
+  "license": "UNLICENSED",
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "mesh": "node tools/mesh.js",
+    "reset": "node tools/reset.js"
+  },
+  "dependencies": {
+    "dotenv": "^17.4.2",
+    "express": "^5.2.1",
+    "ws": "^8.21.3"
+  }
+}
