@@ -44,6 +44,18 @@ function all() {
   return windows.slice();
 }
 
+// Every window newer than the caller's cursor, oldest first. A consumer that polls on its
+// own interval will otherwise silently skip windows whenever the two cadences drift, and a
+// skipped window is a lost EWMA sample rather than a visible failure.
+function since(windowId) {
+  if (windowId === null || windowId === undefined) return windows.slice();
+  const newest = windows[windows.length - 1];
+  if (!newest) return [];
+  // The stream restarted (collector or dev source relaunched): replay what we hold.
+  if (newest.windowId < windowId) return windows.slice();
+  return windows.filter((w) => w.windowId > windowId);
+}
+
 function status() {
   return {
     connected,
@@ -139,4 +151,4 @@ function clear() {
   invalidCount = 0;
 }
 
-module.exports = { start, stop, clear, onWindow, recent, all, status };
+module.exports = { start, stop, clear, onWindow, recent, all, since, status };

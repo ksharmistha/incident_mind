@@ -33,6 +33,16 @@ const derived = {
   // from control.detectErrRate, which is the per-service flag threshold.
   userFacingErrRate: 0.05,
 
+  // The Detector's EWMA baseline is specified as "over a 60s trailing window" (§10.2).
+  // At the collector's 1 Hz cadence that is 60 samples; the EWMA weight is derived from
+  // it rather than chosen.
+  baselineWindows: 60,
+  // An EWMA needs samples before its value means anything. Flagging against a baseline
+  // built from two windows produces noise, not detection. This is an implementation
+  // necessity, not a tuned sensitivity — raising it delays first detection, it does not
+  // change what counts as abnormal.
+  baselineWarmupWindows: 10,
+
   // Probe measurement windows, §11.2 steps 4 and 6.
   probeBaselineWindows: 2,
   probeSettlingWindows: 2,

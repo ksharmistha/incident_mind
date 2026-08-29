@@ -18,8 +18,9 @@ const { WebSocketServer } = require('ws');
 const state = require('./state');
 const supervisor = require('./supervisor');
 const telemetry = require('./adapters/telemetry');
+const { createDetector } = require('./agents/detector');
 const { PORTS, validationEnabled } = require('./adapters/contracts');
-const { control, derived } = require('./adapters/tuning');
+const { tuning, control, derived } = require('./adapters/tuning');
 
 const PORT = Number(process.env.IM_CONTROL_PORT || PORTS.control);
 const HOST = '127.0.0.1';
@@ -34,6 +35,7 @@ app.get('/health', (req, res) => {
 app.post('/reset', (req, res) => {
   const cleared = state.reset();
   telemetry.clear();
+  detector.reset();
   supervisor.resetStats();
   res.json({ ok: true, cleared });
 });
@@ -62,6 +64,7 @@ app.get('/debug/status', (req, res) => {
     validate: validationEnabled,
     telemetry: telemetry.status(),
     supervisor: supervisor.stats(),
+    detector: detector.stats(),
     state: state.get(),
   });
 });
@@ -84,6 +87,22 @@ wss.on('connection', (ws) => {
 
 state.subscribe((current) => {
   for (const ws of wss.clients) send(ws, current);
+});
+
+// The Detector runs on its own interval, reading the newest closed window from the ring.
+// It is deliberately not driven by the telemetry callback: detection must keep running at
+// its own cadence even while everything downstream is waiting on a human approval.
+const detector = createDetector();
+
+supervisor.startInterval('detector', tuning.collector.windowMs, () => {
+  // Every window since the detector's cursor, not just the newest: the detector runs on
+  // its own clock and must not lose EWMA samples when the two cadences drift.
+  let incident = null;
+  for (const w of telemetry.since(detector.stats().lastWindowId)) {
+    incident = detector.observe(w);
+  }
+  if (!incident) return;
+  state.update({ incident }, `detector: ${incident.id} @ window ${incident.lastWindowId}`);
 });
 
 telemetry.start();
